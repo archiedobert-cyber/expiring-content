@@ -29,16 +29,19 @@ import os
 import re
 import sys
 import json
+import time
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 ROLE_ID = os.environ.get("DISCORD_ROLE_ID")
 TEST_MODE = os.environ.get("TEST_MODE") == "1"
 TEST_URL = os.environ.get("TEST_URL", "").strip()
-BOT_USERNAME = "Expiring Content Bot"
 
+BASE = "https://www.fut.gg"
 SBC_URL = "https://www.fut.gg/sbc/category/expiring-soon/"
 OBJECTIVES_URL = "https://www.fut.gg/objectives/expiring-soon/"
 EVOLUTIONS_URL = "https://www.fut.gg/evolutions/"
@@ -48,11 +51,8 @@ STATE_FILE = "state.json"
 # ---------------------------------------------------------------------------
 # LOOK & FEEL - edit the text/emojis here
 # ---------------------------------------------------------------------------
-# Big title shown above the card (Discord's "# " = largest heading size)
 HEADER = "# 🔥📆 **TODAY'S EXPIRING CONTENT** 📆🔥"
 
-# Section titles (Discord's "## " = next biggest size) and the page each
-# "more info" link goes to.
 SBC_TITLE = "🧩 SBCs expiring today"
 OBJECTIVES_TITLE = "🎯 Objectives expiring today"
 EVOLUTIONS_TITLE = "🧬 Evolutions expiring today"
@@ -61,48 +61,44 @@ MORE_INFO_TEXT = "more info"
 EMPTY_TEXT = "Nothing expiring in the next 24 hours"
 CARD_COLOUR = 0x2ECC71  # the green bar down the side of the card
 
-# A Discord embed holds 4096 characters in total, so each section's list is
-# trimmed to this many characters and ends with "…and N more" if it runs long.
+# Objectives/Evolutions lists are trimmed to this many characters and end
+# with "…and N more" if they run long.
 MAX_LIST_CHARS = 1200
+
+# Discord limits: 10 embeds per message, 6000 characters across a message's embeds.
+MAX_EMBEDS_PER_MESSAGE = 10
+MAX_CHARS_PER_MESSAGE = 5500
 # ---------------------------------------------------------------------------
 
-# SBCs: a slug field sits shortly before the real top-level name (nested
-# reward objects never have their own slug), then endTime, then a real
-# per-item url.
 SBC_PATTERN = re.compile(
     r'slug:"[^"]+".{0,60}?name:"(?P<name>[^"]+)".{0,300}?endTime:"(?P<end_time>[^"]+)"'
     r'.{0,700}?url:"(?P<url>[^"]+)"',
     re.DOTALL,
 )
 
-# Objectives: same slug-before-name anchor, but no reliable per-item url
-# field (they use a slug instead) — so we only extract name + endTime here,
-# and link every objective to the category page instead of a specific item.
 OBJECTIVE_PATTERN = re.compile(
     r'slug:"[^"]+".{0,60}?name:"(?P<name>[^"]+)".{0,300}?endTime:"(?P<end_time>[^"]+)"',
     re.DOTALL,
 )
 
-# Evolutions: url, slug and name sit tightly together at the start of each
-# entry, but a large variable-length "trending players" list separates name
-# from endTime — too variable for a fixed window, so we locate the anchor
-# with regex and then search forward for the nearest endTime after it.
 EVOLUTION_ANCHOR = re.compile(
     r'url:"(?P<url>/evolutions/[^"]+)".{0,60}?slug:"[^"]+".{0,60}?name:"(?P<name>[^"]+)"',
     re.DOTALL,
 )
-EVOLUTION_MAX_GAP = 8000  # generous cap so the forward search can't run away
+EVOLUTION_MAX_GAP = 8000
 
-DIGEST_WINDOW_HOURS = 24      # "expiring today" — covers everything from
-                               # this run until the next daily run
+DIGEST_WINDOW_HOURS = 24
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
 
 
 def fetch_page(url):
-    response = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30,
-    )
+    response = requests.get(url, headers=BROWSER_HEADERS, timeout=30)
     response.raise_for_status()
     return response.text
 
@@ -111,10 +107,145 @@ def parse_end_time(iso_str):
     return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
 
 
+# ---------------------------------------------------------------------------
+# SBC images  (same logic as the "New SBC" bot)
+# ---------------------------------------------------------------------------
+def page_text(page):
+    """Raw page HTML with escaped JSON quotes un-escaped, for regex searching."""
+    return str(page).replace('\\"', '"')
+
+
+def find_player_card_image(page):
+    """The actual player card artwork, when the SBC's reward is a player."""
+    m = re.search(r'cardImageUrl:"([^"]+)"', page_text(page))
+    return m.group(1).replace("\\/", "/") if m else None
+
+
+IMAGE_ATTRS = (
+    "src",
+    "data-src",
+    "data-original",
+    "data-lazy-src",
+    "data-lazy",
+    "data-image",
+    "data-url",
+)
+
+
+def find_image(card, url, page=None):
+    """Find an SBC-specific image, preferring fut.gg's own SBC artwork."""
+
+    # A player-card reward has its own artwork - use that in preference to
+    # any generic SBC icon/thumbnail if we can find it.
+    if page is not None:
+        player_image = find_player_card_image(page)
+        if player_image:
+            return player_image
+
+    def is_generic(src):
+        src = src.lower()
+        return (
+            "fut-social" in src
+            or "favicon" in src
+            or "logo" in src
+            or "placeholder" in src
+            or "default-image" in src
+        )
+
+    def clean(src):
+        if not src or src.startswith("data:"):
+            return None
+        src = urljoin(BASE, src.strip())
+        if is_generic(src):
+            return None
+        return src
+
+    def sources(img):
+        """Every image URL an <img> tag might carry (src, lazy-load attrs, srcset)."""
+        for attr in IMAGE_ATTRS:
+            yield img.get(attr)
+        srcset = img.get("srcset") or img.get("data-srcset")
+        if srcset:
+            for item in srcset.split(","):
+                parts = item.strip().split()
+                if parts:
+                    yield parts[0]
+
+    def first_image(container, must_contain=None):
+        for img in container.find_all("img"):
+            for src in sources(img):
+                image = clean(src)
+                if image and (must_contain is None or must_contain in image):
+                    return image
+        return None
+
+    # 1) fut.gg's own artwork for this SBC (game-assets.fut.gg/.../sbcs/...)
+    image = first_image(card, "/sbcs/")
+    if image:
+        return image
+
+    if page is None:
+        try:
+            page = BeautifulSoup(fetch_page(url), "html.parser")
+        except requests.RequestException as e:
+            print(f"Could not fetch SBC page for image: {e}")
+
+    if page is not None:
+        image = first_image(page, "/sbcs/")
+        if image:
+            return image
+
+    # 2) Any other image on the card
+    image = first_image(card)
+    if image:
+        return image
+
+    if page is not None:
+        # 3) Page metadata (Open Graph, then Twitter/X)
+        for attr_name, names in (
+            ("property", ("og:image", "og:image:url")),
+            ("name", ("twitter:image", "twitter:image:src")),
+        ):
+            for name in names:
+                meta = page.find("meta", attrs={attr_name: name})
+                if meta:
+                    image = clean(meta.get("content"))
+                    if image:
+                        return image
+
+        # 4) Any image on the SBC page
+        return first_image(page)
+
+    return None
+
+
+def add_sbc_media(items):
+    """Open each SBC's own page and work out its picture, exactly like the
+    New SBC bot: a player-card reward becomes a large image, anything else
+    becomes a thumbnail. Only used for the SBC section."""
+    for item in items:
+        item["media_kind"] = None
+        item["media_url"] = None
+        try:
+            page = BeautifulSoup(fetch_page(item["url"]), "html.parser")
+        except requests.RequestException as e:
+            print(f"Could not fetch SBC page {item['url']}: {e}")
+            continue
+        is_player = bool(find_player_card_image(page))
+        image = find_image(page, item["url"], page)
+        if image:
+            item["media_kind"] = "image" if is_player else "thumbnail"
+            item["media_url"] = image
+        print(f"  media for {item['name']}: {item['media_kind']} {item['media_url']}")
+        time.sleep(0.5)  # be gentle with the site
+
+
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
 def extract_items(html, pattern, default_url=None):
     """Pull name/endTime (and url, if the pattern captures one) entries out
-    of the raw HTML. If a real url isn't captured, default_url is used for
-    every item instead (e.g. linking to the category page)."""
+    of the raw HTML."""
     items = []
     seen = set()
     for m in pattern.finditer(html):
@@ -132,17 +263,13 @@ def extract_items(html, pattern, default_url=None):
             url = default_url
             dedup_key = (name, groups["end_time"])
         if dedup_key in seen:
-            continue  # the same entry can appear twice in the embedded data
+            continue
         seen.add(dedup_key)
         items.append({"name": name, "end_time": end_dt, "url": url})
     return items
 
 
 def extract_evolutions(html):
-    """Evolutions need a different approach from SBCs/Objectives: find each
-    entry's name/url anchor with regex, then plain-search forward for its
-    endTime rather than trying to bound a variable-length gap in the regex
-    itself (the trending-players list in between can be huge)."""
     items = []
     seen = set()
     for m in EVOLUTION_ANCHOR.finditer(html):
@@ -240,17 +367,17 @@ def format_time_remaining(end_dt, now):
     return f"{minutes}m"
 
 
+def item_text(item, now):
+    """**Name** — 8h 53m left"""
+    return f"**{item['name']}** — {format_time_remaining(item['end_time'], now)} left"
+
+
 def format_items(items, now):
-    """Soonest-expiring first, e.g.  • [Name](link) — 8h 53m left"""
     items = sorted(items, key=lambda i: i["end_time"])
-    return [
-        f"• [{item['name']}]({item['url']}) — {format_time_remaining(item['end_time'], now)} left"
-        for item in items
-    ]
+    return [f"• {item_text(item, now)}" for item in items]
 
 
 def fit_lines(lines, max_chars):
-    """Keep as many whole lines as fit; end with '…and N more' if some don't."""
     kept = []
     used = 0
     for shown, line in enumerate(lines):
@@ -264,64 +391,95 @@ def fit_lines(lines, max_chars):
     return kept
 
 
-def build_section(title, more_info_url, items, now):
-    """## Title
-    [more info](url)
-    • item — time left ..."""
+def build_section_embed(title, more_info_url, items, now):
+    """Objectives / Evolutions: one embed with a bulleted list."""
     lines = [f"## {title}", f"[{MORE_INFO_TEXT}]({more_info_url})"]
     if items:
         lines.extend(fit_lines(format_items(items, now), MAX_LIST_CHARS))
     else:
         lines.append(EMPTY_TEXT)
-    return "\n".join(lines)
+    return {"description": "\n".join(lines), "color": CARD_COLOUR}
 
 
-def build_payload(sbcs, objectives, evolutions, now):
-    # A section passed as None is left out completely (used when testing one page).
-    sections = [
-        (SBC_TITLE, SBC_URL, sbcs),
-        (OBJECTIVES_TITLE, OBJECTIVES_URL, objectives),
-        (EVOLUTIONS_TITLE, EVOLUTIONS_URL, evolutions),
-    ]
-    description = "\n\n".join(
-        build_section(title, more_info_url, items, now)
-        for title, more_info_url, items in sections
-        if items is not None
-    )
-    return {
-        "username": BOT_USERNAME,
-        "content": HEADER,
-        "embeds": [{"description": description, "color": CARD_COLOUR}],
-    }
+def build_sbc_embeds(items, now):
+    """SBCs: a title embed, then one embed per SBC so each can carry its own
+    image (player rewards) or thumbnail (everything else)."""
+    lines = [f"## {SBC_TITLE}", f"[{MORE_INFO_TEXT}]({SBC_URL})"]
+    if not items:
+        lines.append(EMPTY_TEXT)
+    embeds = [{"description": "\n".join(lines), "color": CARD_COLOUR}]
+
+    for item in sorted(items, key=lambda i: i["end_time"]):
+        embed = {"description": item_text(item, now), "color": CARD_COLOUR}
+        if item.get("media_kind") == "image":
+            embed["image"] = {"url": item["media_url"]}
+        elif item.get("media_kind") == "thumbnail":
+            embed["thumbnail"] = {"url": item["media_url"]}
+        embeds.append(embed)
+    return embeds
 
 
-def send_to_discord(payload):
+def embed_size(embed):
+    return len(embed.get("description", ""))
+
+
+def build_payloads(sbcs, objectives, evolutions, now):
+    """Returns a list of webhook payloads (Discord allows max 10 embeds and
+    ~6000 characters per message, so a long SBC list may span several).
+    A section passed as None is left out completely."""
+    embeds = []
+    if sbcs is not None:
+        embeds.extend(build_sbc_embeds(sbcs, now))
+    if objectives is not None:
+        embeds.append(build_section_embed(OBJECTIVES_TITLE, OBJECTIVES_URL, objectives, now))
+    if evolutions is not None:
+        embeds.append(build_section_embed(EVOLUTIONS_TITLE, EVOLUTIONS_URL, evolutions, now))
+
+    chunks, current, current_chars = [], [], 0
+    for embed in embeds:
+        size = embed_size(embed)
+        if current and (len(current) >= MAX_EMBEDS_PER_MESSAGE
+                        or current_chars + size > MAX_CHARS_PER_MESSAGE):
+            chunks.append(current)
+            current, current_chars = [], 0
+        current.append(embed)
+        current_chars += size
+    if current:
+        chunks.append(current)
+
+    payloads = []
+    for i, chunk in enumerate(chunks):
+        payload = {"embeds": chunk}
+        if i == 0:
+            payload["content"] = HEADER
+        payloads.append(payload)
+    return payloads
+
+
+def post(payload):
     if not WEBHOOK_URL:
         raise RuntimeError("DISCORD_WEBHOOK_URL is not configured.")
     response = requests.post(WEBHOOK_URL, json=payload, timeout=30)
     response.raise_for_status()
 
 
+def send_payloads(payloads):
+    for payload in payloads:
+        post(payload)
+        time.sleep(1)
+
+
 def send_role_ping():
-    """Sends a short follow-up message pinging the alert role, right after
-    the digest, so it appears just below it in the channel."""
     if not ROLE_ID:
         print("DISCORD_ROLE_ID not set — skipping role ping.")
         return
-    payload = {
-        "username": BOT_USERNAME,
+    post({
         "content": f"<@&{ROLE_ID}>",
-        "allowed_mentions": {"roles": [ROLE_ID]},  # can only ping this one role
-    }
-    response = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-    response.raise_for_status()
+        "allowed_mentions": {"roles": [ROLE_ID]},
+    })
 
 
 def fetch_test_sections(url, now):
-    """For TEST_URL: read just that one page and return (sbcs, objectives,
-    evolutions) with the other two set to None so they're left out of the post.
-    The section is judged from the address; anything already expired is skipped,
-    but the 24-hour window is NOT applied so you can see the whole page."""
     lowered = url.lower()
     if "/objectives" in lowered:
         items = fetch_items(url, "Objectives", OBJECTIVE_PATTERN, default_url=OBJECTIVES_URL)
@@ -334,6 +492,8 @@ def fetch_test_sections(url, now):
         section = "sbcs"
 
     items = [i for i in items if i["end_time"] > now]
+    if section == "sbcs":
+        add_sbc_media(items)
     print(f"Test page treated as {section}: {len(items)} item(s) not yet expired.")
     return (
         items if section == "sbcs" else None,
@@ -354,12 +514,12 @@ def main():
     if TEST_URL:
         print(f"TEST_URL set - posting just this page: {TEST_URL}")
         sbcs, objectives, evolutions = fetch_test_sections(TEST_URL, now)
-        payload = build_payload(sbcs, objectives, evolutions, now)
+        payloads = build_payloads(sbcs, objectives, evolutions, now)
         if dry_run:
-            print("DRY RUN - nothing posted. Message would be:")
-            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            print("DRY RUN - nothing posted. Messages would be:")
+            print(json.dumps(payloads, indent=2, ensure_ascii=False))
             return
-        send_to_discord(payload)
+        send_payloads(payloads)
         send_role_ping()
         print("Test post sent. state.json was not changed.")
         return
@@ -377,14 +537,17 @@ def main():
     sbcs = filter_within(all_sbcs, now, window)
     objectives = filter_within(all_objectives, now, window)
     evolutions = filter_within(all_evolutions, now, window)
-    payload = build_payload(sbcs, objectives, evolutions, now)
+
+    add_sbc_media(sbcs)  # only the SBCs actually expiring get their pages opened
+
+    payloads = build_payloads(sbcs, objectives, evolutions, now)
 
     if dry_run:
-        print("DRY RUN - nothing posted. Message would be:")
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print("DRY RUN - nothing posted. Messages would be:")
+        print(json.dumps(payloads, indent=2, ensure_ascii=False))
         return
 
-    send_to_discord(payload)
+    send_payloads(payloads)
     send_role_ping()
 
     state["last_digest_date"] = today
