@@ -118,6 +118,13 @@ def find_player_card_image(page):
     return m.group(1).replace("\\/", "/") if m else None
 
 
+def find_player_rating(page):
+    """The overall rating of the reward player (e.g. 84), or 0 if not found.
+    Uses the same page data the New SBC bot reads for 'Name - OVR - Rarity'."""
+    m = re.search(r'overall:(\d+),commonName:"', page_text(page))
+    return int(m.group(1)) if m else 0
+
+
 IMAGE_ATTRS = (
     "src",
     "data-src",
@@ -223,17 +230,19 @@ def add_sbc_media(items):
     for item in items:
         item["media_kind"] = None
         item["media_url"] = None
+        item["rating"] = 0
         try:
             page = BeautifulSoup(fetch_page(item["url"]), "html.parser")
         except requests.RequestException as e:
             print(f"Could not fetch SBC page {item['url']}: {e}")
             continue
         is_player = bool(find_player_card_image(page))
+        item["rating"] = find_player_rating(page) if is_player else 0
         image = find_image(page, item["url"], page)
         if image:
             item["media_kind"] = "image" if is_player else "thumbnail"
             item["media_url"] = image
-        print(f"  media for {item['name']}: {item['media_kind']} {item['media_url']}")
+        print(f"  media for {item['name']}: {item['media_kind']} {item['media_url']} (rating {item['rating']})")
         time.sleep(0.5)  # be gentle with the site
 
 
@@ -400,16 +409,20 @@ def build_section_text(title, more_info_url, items, now):
 
 def pick_card_media(sbcs):
     """The whole card gets ONE picture, taken from the SBC section only.
-    If any expiring SBC is a player SBC, its card is shown as the large image
-    under everything (soonest-expiring player first). Otherwise the
+    Player SBCs always win: if any expiring SBC is a player SBC, the
+    highest-rated player's card is shown as the large image under everything
+    (if ratings tie, the one expiring soonest wins). Otherwise the
     soonest-expiring SBC's artwork is used as the top-right thumbnail."""
     with_media = [
         i for i in sorted(sbcs or [], key=lambda i: i["end_time"])
         if i.get("media_url")
     ]
-    for item in with_media:
-        if item["media_kind"] == "image":
-            return "image", item["media_url"]
+    players = [i for i in with_media if i["media_kind"] == "image"]
+    if players:
+        # max() keeps the first of equal ratings, and the list is already
+        # sorted soonest-first, so ties go to the one expiring soonest.
+        best = max(players, key=lambda i: i.get("rating", 0))
+        return "image", best["media_url"]
     if with_media:
         return "thumbnail", with_media[0]["media_url"]
     return None, None
