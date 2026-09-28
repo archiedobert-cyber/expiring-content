@@ -1,14 +1,28 @@
 """
-FC 26 Expiry Checker
----------------------
+Expiring Content Checker  (redesigned layout)
+----------------------------------------------
 Posts a daily Discord digest of expiring SBCs, Objectives, and Evolutions.
 
 Usage:
-    python fc26_expiry.py [--force]
+    python expiring.py [--force] [--dry-run]
+
+Secrets / environment variables (set these as GitHub repository secrets):
+    DISCORD_WEBHOOK_URL   the webhook the digest is posted to
+    DISCORD_ROLE_ID       the role to ping under the digest (optional)
+
+Test options (the two boxes on the workflow's "Run workflow" button):
+    TEST_MODE=1           same as --force: send even if today's digest was
+                          already sent
+    TEST_URL=<page link>  post just that one page's section (an SBC,
+                          Objectives or Evolutions page) and ignore the 24-hour
+                          window. Nothing is saved to state.json, so it never
+                          affects the real daily post.
 
 State (state.json) tracks whether today's digest has already been sent so a
 manual re-run or an accidental double-trigger won't spam duplicate posts.
 Pass --force to bypass that check when testing.
+Pass --dry-run (or set DRY_RUN=1) to print the message instead of posting it;
+a dry run never touches state.json.
 """
 
 import os
@@ -21,6 +35,8 @@ import requests
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 ROLE_ID = os.environ.get("DISCORD_ROLE_ID")
+TEST_MODE = os.environ.get("TEST_MODE") == "1"
+TEST_URL = os.environ.get("TEST_URL", "").strip()
 BOT_USERNAME = "Expiring Content Bot"
 
 SBC_URL = "https://www.fut.gg/sbc/category/expiring-soon/"
@@ -28,6 +44,27 @@ OBJECTIVES_URL = "https://www.fut.gg/objectives/expiring-soon/"
 EVOLUTIONS_URL = "https://www.fut.gg/evolutions/"
 
 STATE_FILE = "state.json"
+
+# ---------------------------------------------------------------------------
+# LOOK & FEEL - edit the text/emojis here
+# ---------------------------------------------------------------------------
+# Big title shown above the card (Discord's "# " = largest heading size)
+HEADER = "# 🔥📆 **TODAY'S EXPIRING CONTENT** 📆🔥"
+
+# Section titles (Discord's "## " = next biggest size) and the page each
+# "more info" link goes to.
+SBC_TITLE = "🧩 SBCs expiring today"
+OBJECTIVES_TITLE = "🎯 Objectives expiring today"
+EVOLUTIONS_TITLE = "🧬 Evolutions expiring today"
+MORE_INFO_TEXT = "more info"
+
+EMPTY_TEXT = "Nothing expiring in the next 24 hours"
+CARD_COLOUR = 0x2ECC71  # the green bar down the side of the card
+
+# A Discord embed holds 4096 characters in total, so each section's list is
+# trimmed to this many characters and ends with "…and N more" if it runs long.
+MAX_LIST_CHARS = 1200
+# ---------------------------------------------------------------------------
 
 # SBCs: a slug field sits shortly before the real top-level name (nested
 # reward objects never have their own slug), then endTime, then a real
@@ -131,11 +168,11 @@ def extract_evolutions(html):
     return items
 
 
-def fetch_evolutions():
+def fetch_evolutions(url=EVOLUTIONS_URL):
     label = "Evolutions"
-    print(f"Fetching {label} from {EVOLUTIONS_URL} ...")
+    print(f"Fetching {label} from {url} ...")
     try:
-        html = fetch_page(EVOLUTIONS_URL)
+        html = fetch_page(url)
         print(f"Fetched {label}: {len(html)} chars. Parsing ...")
         items = extract_evolutions(html)
         print(f"Parsed {label}: {len(items)} items found (before time filtering).")
@@ -187,6 +224,9 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
 def format_time_remaining(end_dt, now):
     remaining = end_dt - now
     total_minutes = int(remaining.total_seconds() // 60)
@@ -201,78 +241,132 @@ def format_time_remaining(end_dt, now):
 
 
 def format_items(items, now):
+    """Soonest-expiring first, e.g.  • [Name](link) — 8h 53m left"""
+    items = sorted(items, key=lambda i: i["end_time"])
     return [
         f"• [{item['name']}]({item['url']}) — {format_time_remaining(item['end_time'], now)} left"
         for item in items
     ]
 
 
-def build_digest_message(sbcs, objectives, evolutions, now):
-    lines = []
+def fit_lines(lines, max_chars):
+    """Keep as many whole lines as fit; end with '…and N more' if some don't."""
+    kept = []
+    used = 0
+    for shown, line in enumerate(lines):
+        remaining_after = len(lines) - (shown + 1)
+        reserve = len(f"\n…and {remaining_after} more") if remaining_after else 0
+        if used + len(line) + 1 + reserve > max_chars:
+            kept.append(f"…and {len(lines) - shown} more")
+            return kept
+        kept.append(line)
+        used += len(line) + 1
+    return kept
 
-    lines.append("**🧩 SBCs expiring today**")
-    if sbcs:
-        lines.extend(format_items(sbcs, now))
+
+def build_section(title, more_info_url, items, now):
+    """## Title
+    [more info](url)
+    • item — time left ..."""
+    lines = [f"## {title}", f"[{MORE_INFO_TEXT}]({more_info_url})"]
+    if items:
+        lines.extend(fit_lines(format_items(items, now), MAX_LIST_CHARS))
     else:
-        lines.append(f"Nothing expiring in the next 24 hours — [check what's expiring soon here]({SBC_URL})")
-    lines.append("")
-
-    lines.append("**🎯 Objectives expiring today**")
-    if objectives:
-        lines.extend(format_items(objectives, now))
-    else:
-        lines.append(f"Nothing expiring in the next 24 hours — [check what's expiring soon here]({OBJECTIVES_URL})")
-    lines.append("")
-
-    lines.append("**🧬 Evolutions expiring today**")
-    if evolutions:
-        lines.extend(format_items(evolutions, now))
-    else:
-        lines.append(f"Nothing expiring in the next 24 hours — [check what's expiring soon here]({EVOLUTIONS_URL})")
-
+        lines.append(EMPTY_TEXT)
     return "\n".join(lines)
 
 
-def send_to_discord(content, title):
+def build_payload(sbcs, objectives, evolutions, now):
+    # A section passed as None is left out completely (used when testing one page).
+    sections = [
+        (SBC_TITLE, SBC_URL, sbcs),
+        (OBJECTIVES_TITLE, OBJECTIVES_URL, objectives),
+        (EVOLUTIONS_TITLE, EVOLUTIONS_URL, evolutions),
+    ]
+    description = "\n\n".join(
+        build_section(title, more_info_url, items, now)
+        for title, more_info_url, items in sections
+        if items is not None
+    )
+    return {
+        "username": BOT_USERNAME,
+        "content": HEADER,
+        "embeds": [{"description": description, "color": CARD_COLOUR}],
+    }
+
+
+def send_to_discord(payload):
     if not WEBHOOK_URL:
         raise RuntimeError("DISCORD_WEBHOOK_URL is not configured.")
-    payload = {
-        "username": BOT_USERNAME,
-        "embeds": [{
-            "title": title,
-            "description": content[:4000],
-            "footer": {"text": BOT_USERNAME},
-        }],
-    }
     response = requests.post(WEBHOOK_URL, json=payload, timeout=30)
     response.raise_for_status()
 
 
 def send_role_ping():
     """Sends a short follow-up message pinging the alert role, right after
-    the digest embed, so it appears just below it in the channel."""
+    the digest, so it appears just below it in the channel."""
     if not ROLE_ID:
         print("DISCORD_ROLE_ID not set — skipping role ping.")
         return
     payload = {
         "username": BOT_USERNAME,
         "content": f"<@&{ROLE_ID}>",
-        "allowed_mentions": {"parse": ["roles"]},
+        "allowed_mentions": {"roles": [ROLE_ID]},  # can only ping this one role
     }
     response = requests.post(WEBHOOK_URL, json=payload, timeout=30)
     response.raise_for_status()
 
 
+def fetch_test_sections(url, now):
+    """For TEST_URL: read just that one page and return (sbcs, objectives,
+    evolutions) with the other two set to None so they're left out of the post.
+    The section is judged from the address; anything already expired is skipped,
+    but the 24-hour window is NOT applied so you can see the whole page."""
+    lowered = url.lower()
+    if "/objectives" in lowered:
+        items = fetch_items(url, "Objectives", OBJECTIVE_PATTERN, default_url=OBJECTIVES_URL)
+        section = "objectives"
+    elif "/evolutions" in lowered:
+        items = fetch_evolutions(url)
+        section = "evolutions"
+    else:
+        items = fetch_items(url, "SBCs", SBC_PATTERN)
+        section = "sbcs"
+
+    items = [i for i in items if i["end_time"] > now]
+    print(f"Test page treated as {section}: {len(items)} item(s) not yet expired.")
+    return (
+        items if section == "sbcs" else None,
+        items if section == "objectives" else None,
+        items if section == "evolutions" else None,
+    )
+
+
 def main():
-    force = "--force" in sys.argv[1:]
+    args = sys.argv[1:]
+    force = "--force" in args or TEST_MODE
+    dry_run = "--dry-run" in args or os.environ.get("DRY_RUN") == "1"
 
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
     state = load_state()
 
-    if not force and state.get("last_digest_date") == today:
+    if TEST_URL:
+        print(f"TEST_URL set - posting just this page: {TEST_URL}")
+        sbcs, objectives, evolutions = fetch_test_sections(TEST_URL, now)
+        payload = build_payload(sbcs, objectives, evolutions, now)
+        if dry_run:
+            print("DRY RUN - nothing posted. Message would be:")
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+        send_to_discord(payload)
+        send_role_ping()
+        print("Test post sent. state.json was not changed.")
+        return
+
+    if not force and not dry_run and state.get("last_digest_date") == today:
         print(f"Digest already sent today ({today}), skipping to avoid a duplicate.")
-        print("(Re-run with the 'force' option checked to bypass this for testing.)")
+        print("(Tick the 'Test' box when you run the workflow to send it again.)")
         return
 
     all_sbcs = fetch_items(SBC_URL, "SBCs", SBC_PATTERN)
@@ -283,8 +377,14 @@ def main():
     sbcs = filter_within(all_sbcs, now, window)
     objectives = filter_within(all_objectives, now, window)
     evolutions = filter_within(all_evolutions, now, window)
-    content = build_digest_message(sbcs, objectives, evolutions, now)
-    send_to_discord(content, "🔥 Today's Expiring Content")
+    payload = build_payload(sbcs, objectives, evolutions, now)
+
+    if dry_run:
+        print("DRY RUN - nothing posted. Message would be:")
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    send_to_discord(payload)
     send_role_ping()
 
     state["last_digest_date"] = today
