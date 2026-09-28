@@ -2,11 +2,16 @@ name: Expiring Content Checker
 on:
   workflow_dispatch:
     inputs:
-      force:
-        description: "Ignore today's dedup state and send again (for testing)"
+      test:
+        description: "Test (send again even if today's digest was already posted)"
         required: false
         default: false
         type: boolean
+      test_url:
+        description: "Test a specific page: paste an SBC, Objectives or Evolutions link (optional)"
+        required: false
+        default: ""
+        type: string
   schedule:
     # Runs are in UTC. This targets roughly 9am UK — 9 hours before the
     # 6pm daily expiry. UK clocks shift for daylight saving, so actual
@@ -32,11 +37,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run FC26 expiry checker
+      - name: Run expiry checker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
-        run: python fc26_expiry.py ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+          TEST_MODE: ${{ inputs.test && '1' || '' }}
+          TEST_URL: ${{ inputs.test_url }}
+        run: python expiring.py
 
       - name: Commit updated state
         run: |
