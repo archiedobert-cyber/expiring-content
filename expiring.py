@@ -61,13 +61,10 @@ MORE_INFO_TEXT = "more info"
 EMPTY_TEXT = "Nothing expiring in the next 24 hours"
 CARD_COLOUR = 0x2ECC71  # the green bar down the side of the card
 
-# Objectives/Evolutions lists are trimmed to this many characters and end
-# with "…and N more" if they run long.
+# Each section's list is trimmed to this many characters and ends with
+# "…and N more" if it runs long (a card holds 4096 characters in total).
 MAX_LIST_CHARS = 1200
 
-# Discord limits: 10 embeds per message, 6000 characters across a message's embeds.
-MAX_EMBEDS_PER_MESSAGE = 10
-MAX_CHARS_PER_MESSAGE = 5500
 # ---------------------------------------------------------------------------
 
 SBC_PATTERN = re.compile(
@@ -221,8 +218,8 @@ def find_image(card, url, page=None):
 
 def add_sbc_media(items):
     """Open each SBC's own page and work out its picture, exactly like the
-    New SBC bot: a player-card reward becomes a large image, anything else
-    becomes a thumbnail. Only used for the SBC section."""
+    New SBC bot: a player-card reward counts as a player (large image),
+    anything else counts as a thumbnail. Only used for the SBC section."""
     for item in items:
         item["media_kind"] = None
         item["media_url"] = None
@@ -391,69 +388,57 @@ def fit_lines(lines, max_chars):
     return kept
 
 
-def build_section_embed(title, more_info_url, items, now):
-    """Objectives / Evolutions: one embed with a bulleted list."""
+def build_section_text(title, more_info_url, items, now):
+    """One section of the card: heading, 'more info' link, then the list."""
     lines = [f"## {title}", f"[{MORE_INFO_TEXT}]({more_info_url})"]
     if items:
         lines.extend(fit_lines(format_items(items, now), MAX_LIST_CHARS))
     else:
         lines.append(EMPTY_TEXT)
-    return {"description": "\n".join(lines), "color": CARD_COLOUR}
+    return "\n".join(lines)
 
 
-def build_sbc_embeds(items, now):
-    """SBCs: a title embed, then one embed per SBC so each can carry its own
-    image (player rewards) or thumbnail (everything else)."""
-    lines = [f"## {SBC_TITLE}", f"[{MORE_INFO_TEXT}]({SBC_URL})"]
-    if not items:
-        lines.append(EMPTY_TEXT)
-    embeds = [{"description": "\n".join(lines), "color": CARD_COLOUR}]
-
-    for item in sorted(items, key=lambda i: i["end_time"]):
-        embed = {"description": item_text(item, now), "color": CARD_COLOUR}
-        if item.get("media_kind") == "image":
-            embed["image"] = {"url": item["media_url"]}
-        elif item.get("media_kind") == "thumbnail":
-            embed["thumbnail"] = {"url": item["media_url"]}
-        embeds.append(embed)
-    return embeds
-
-
-def embed_size(embed):
-    return len(embed.get("description", ""))
+def pick_card_media(sbcs):
+    """The whole card gets ONE picture, taken from the SBC section only.
+    If any expiring SBC is a player SBC, its card is shown as the large image
+    under everything (soonest-expiring player first). Otherwise the
+    soonest-expiring SBC's artwork is used as the top-right thumbnail."""
+    with_media = [
+        i for i in sorted(sbcs or [], key=lambda i: i["end_time"])
+        if i.get("media_url")
+    ]
+    for item in with_media:
+        if item["media_kind"] == "image":
+            return "image", item["media_url"]
+    if with_media:
+        return "thumbnail", with_media[0]["media_url"]
+    return None, None
 
 
 def build_payloads(sbcs, objectives, evolutions, now):
-    """Returns a list of webhook payloads (Discord allows max 10 embeds and
-    ~6000 characters per message, so a long SBC list may span several).
-    A section passed as None is left out completely."""
-    embeds = []
+    """Builds ONE message containing ONE card with every section in it.
+    A section passed as None is left out completely (used when testing one
+    page). Returns a list so the sending code stays the same."""
+    sections = []
     if sbcs is not None:
-        embeds.extend(build_sbc_embeds(sbcs, now))
+        sections.append(build_section_text(SBC_TITLE, SBC_URL, sbcs, now))
     if objectives is not None:
-        embeds.append(build_section_embed(OBJECTIVES_TITLE, OBJECTIVES_URL, objectives, now))
+        sections.append(build_section_text(OBJECTIVES_TITLE, OBJECTIVES_URL, objectives, now))
     if evolutions is not None:
-        embeds.append(build_section_embed(EVOLUTIONS_TITLE, EVOLUTIONS_URL, evolutions, now))
+        sections.append(build_section_text(EVOLUTIONS_TITLE, EVOLUTIONS_URL, evolutions, now))
 
-    chunks, current, current_chars = [], [], 0
-    for embed in embeds:
-        size = embed_size(embed)
-        if current and (len(current) >= MAX_EMBEDS_PER_MESSAGE
-                        or current_chars + size > MAX_CHARS_PER_MESSAGE):
-            chunks.append(current)
-            current, current_chars = [], 0
-        current.append(embed)
-        current_chars += size
-    if current:
-        chunks.append(current)
+    embed = {
+        "description": "\n\n".join(sections)[:4000],
+        "color": CARD_COLOUR,
+    }
 
-    payloads = []
-    for i, chunk in enumerate(chunks):
-        payload = {"embeds": chunk}
-        if i == 0:
-            payload["content"] = HEADER
-        payloads.append(payload)
-    return payloads
+    kind, media_url = pick_card_media(sbcs)
+    if kind == "image":
+        embed["image"] = {"url": media_url}          # big, under everything
+    elif kind == "thumbnail":
+        embed["thumbnail"] = {"url": media_url}      # small, top right
+
+    return [{"content": HEADER, "embeds": [embed]}]
 
 
 def post(payload):
