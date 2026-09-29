@@ -53,9 +53,9 @@ STATE_FILE = "state.json"
 # ---------------------------------------------------------------------------
 HEADER = "# 🔥📆 **TODAY'S EXPIRING CONTENT** 📆🔥"
 
-SBC_TITLE = "🧩 SBCs expiring today"
-OBJECTIVES_TITLE = "🎯 Objectives expiring today"
-EVOLUTIONS_TITLE = "🧬 Evolutions expiring today"
+SBC_TITLE = "🧩 SBCs"
+OBJECTIVES_TITLE = "🎯 Objectives"
+EVOLUTIONS_TITLE = "🧬 Evolutions"
 MORE_INFO_TEXT = "more info"
 
 EMPTY_TEXT = "Nothing expiring in the next 24 hours"
