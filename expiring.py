@@ -51,7 +51,7 @@ STATE_FILE = "state.json"
 # ---------------------------------------------------------------------------
 # LOOK & FEEL - edit the text/emojis here
 # ---------------------------------------------------------------------------
-HEADER = "# 🔥📆 **TODAY'S EXPIRING CONTENT** 📆🔥"
+HEADER = "# 🔥📆 **EXPIRING TODAY** 📆🔥"
 
 SBC_TITLE = "🧩 SBCs"
 OBJECTIVES_TITLE = "🎯 Objectives"
