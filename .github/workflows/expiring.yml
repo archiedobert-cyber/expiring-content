@@ -24,6 +24,11 @@ jobs:
   check-expiring-content:
     runs-on: ubuntu-latest
     steps:
+      - name: Show trigger info
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Started: $(date -u)"
+
       - name: Check out repository
         uses: actions/checkout@v4
 
