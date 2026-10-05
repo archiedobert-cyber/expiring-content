@@ -17,7 +17,7 @@ on:
     # 6pm daily expiry. UK clocks shift for daylight saving, so actual
     # local time may drift by an hour for part of the year — adjust if
     # that matters to you.
-    - cron: "2 8 * * *"  # daily digest
+    - cron: "0 8 * * *"  # daily digest
 permissions:
   contents: write
 jobs:
