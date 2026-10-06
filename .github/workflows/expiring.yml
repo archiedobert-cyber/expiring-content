@@ -1,23 +1,14 @@
-name: Expiring Content Checker
 on:
   workflow_dispatch:
     inputs:
       test:
-        description: "Test (send again even if today's digest was already posted)"
-        required: false
-        default: false
+        description: "Test mode"
         type: boolean
+        default: false
       test_url:
-        description: "Test a specific page: paste an SBC, Objectives or Evolutions link (optional)"
-        required: false
-        default: ""
+        description: "Test URL"
         type: string
-  schedule:
-    # Runs are in UTC. This targets roughly 9am UK — 9 hours before the
-    # 6pm daily expiry. UK clocks shift for daylight saving, so actual
-    # local time may drift by an hour for part of the year — adjust if
-    # that matters to you.
-    - cron: "0 8 * * *"  # daily digest
+        default: ""
 permissions:
   contents: write
 jobs:
