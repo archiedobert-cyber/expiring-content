@@ -7,16 +7,21 @@ Usage:
     python expiring.py [--force] [--dry-run]
 
 Secrets / environment variables (set these as GitHub repository secrets):
-    DISCORD_WEBHOOK_URL   the webhook the digest is posted to
-    DISCORD_ROLE_ID       the role to ping under the digest (optional)
+    DISCORD_WEBHOOK_URL     the webhook the digest is posted to (server 1)
+    DISCORD_ROLE_ID         the role to ping under the digest in server 1 (optional)
+    DISCORD_WEBHOOK_URL_2   a second webhook (server 2) - optional
+    DISCORD_ROLE_ID_2       the role to ping in server 2 - optional
+
+The name and picture each post appears under are the ones set on the Discord
+webhook itself; this script does not override them.
 
 Test options (the two boxes on the workflow's "Run workflow" button):
     TEST_MODE=1           same as --force: send even if today's digest was
                           already sent
     TEST_URL=<page link>  post just that one page's section (an SBC,
                           Objectives or Evolutions page) and ignore the 24-hour
-                          window. Nothing is saved to state.json, so it never
-                          affects the real daily post.
+                          window. Posts to server 1 only. Nothing is saved to
+                          state.json, so it never affects the real daily post.
 
 State (state.json) tracks whether today's digest has already been sent so a
 manual re-run or an accidental double-trigger won't spam duplicate posts.
@@ -36,8 +41,18 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-ROLE_ID = os.environ.get("DISCORD_ROLE_ID")
+# Each destination is (webhook_url, role_id). Server 2 is used only if its
+# secrets are set; leave them unset and the bot posts to server 1 only.
+_RAW_DESTINATIONS = [
+    (os.environ.get("DISCORD_WEBHOOK_URL"), os.environ.get("DISCORD_ROLE_ID")),
+    (os.environ.get("DISCORD_WEBHOOK_URL_2"), os.environ.get("DISCORD_ROLE_ID_2")),
+]
+DESTINATIONS = [
+    (url.strip(), (role or "").strip() or None)
+    for url, role in _RAW_DESTINATIONS
+    if url and url.strip()
+]
+
 TEST_MODE = os.environ.get("TEST_MODE") == "1"
 TEST_URL = os.environ.get("TEST_URL", "").strip()
 
@@ -454,27 +469,45 @@ def build_payloads(sbcs, objectives, evolutions, now):
     return [{"content": HEADER, "embeds": [embed]}]
 
 
-def post(payload):
-    if not WEBHOOK_URL:
-        raise RuntimeError("DISCORD_WEBHOOK_URL is not configured.")
-    response = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-    response.raise_for_status()
-
-
-def send_payloads(payloads):
-    for payload in payloads:
-        post(payload)
-        time.sleep(1)
-
-
-def send_role_ping():
-    if not ROLE_ID:
-        print("DISCORD_ROLE_ID not set — skipping role ping.")
+# ---------------------------------------------------------------------------
+# Sending
+# ---------------------------------------------------------------------------
+def post(url, payload):
+    """Post one message to one webhook. The name and picture shown are the
+    ones set on the webhook itself. Waits and retries if Discord rate limits."""
+    for _ in range(3):
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code == 429:
+            time.sleep(float(response.json().get("retry_after", 2)))
+            continue
+        response.raise_for_status()
         return
-    post({
-        "content": f"<@&{ROLE_ID}>",
-        "allowed_mentions": {"roles": [ROLE_ID]},
-    })
+    raise RuntimeError("Discord kept rate limiting this webhook.")
+
+
+def send_everywhere(payloads, destinations):
+    """Post the digest, then the role ping, to each server in turn.
+    One server failing doesn't stop the others. Returns a list of errors."""
+    if not destinations:
+        raise RuntimeError("DISCORD_WEBHOOK_URL is not configured.")
+    errors = []
+    for n, (url, role_id) in enumerate(destinations, start=1):
+        try:
+            for payload in payloads:
+                post(url, payload)
+                time.sleep(1)
+            if role_id:
+                post(url, {
+                    "content": f"<@&{role_id}>",
+                    "allowed_mentions": {"roles": [role_id]},
+                })
+            else:
+                print(f"Server {n}: no role ID set - skipping role ping.")
+            print(f"Server {n}: posted.")
+        except Exception as exc:
+            # Only the error type is logged, so a webhook URL never appears in the log.
+            errors.append(f"Server {n} failed: {type(exc).__name__}")
+    return errors
 
 
 def fetch_test_sections(url, now):
@@ -517,8 +550,10 @@ def main():
             print("DRY RUN - nothing posted. Messages would be:")
             print(json.dumps(payloads, indent=2, ensure_ascii=False))
             return
-        send_payloads(payloads)
-        send_role_ping()
+        # Test posts go to the first server only.
+        errors = send_everywhere(payloads, DESTINATIONS[:1])
+        if errors:
+            raise RuntimeError("; ".join(errors))
         print("Test post sent. state.json was not changed.")
         return
 
@@ -545,11 +580,16 @@ def main():
         print(json.dumps(payloads, indent=2, ensure_ascii=False))
         return
 
-    send_payloads(payloads)
-    send_role_ping()
+    errors = send_everywhere(payloads, DESTINATIONS)
 
-    state["last_digest_date"] = today
-    save_state(state)
+    # Save state if at least one server received the digest, so a re-run
+    # doesn't repost to the server that already got it.
+    if len(errors) < len(DESTINATIONS):
+        state["last_digest_date"] = today
+        save_state(state)
+
+    if errors:
+        raise RuntimeError("; ".join(errors))
     print("Digest posted successfully.")
 
 
