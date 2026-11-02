@@ -37,6 +37,9 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
+          DISCORD_WEBHOOK_URL_2: ${{ secrets.DISCORD_WEBHOOK_URL_2 }}
+          DISCORD_ROLE_ID_2: ${{ secrets.DISCORD_ROLE_ID_2 }}
+          BRAND_AVATAR_URL: ${{ secrets.BRAND_AVATAR_URL }}
           TEST_MODE: ${{ inputs.test && '1' || '' }}
           TEST_URL: ${{ inputs.test_url }}
         run: python expiring.py
