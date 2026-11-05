@@ -11,6 +11,7 @@ Secrets / environment variables (set these as GitHub repository secrets):
     DISCORD_ROLE_ID         the role to ping under the digest in server 1 (optional)
     DISCORD_WEBHOOK_URL_2   a second webhook (server 2) - optional
     DISCORD_ROLE_ID_2       the role to ping in server 2 - optional
+    TEST_TARGET             both / server 1 / server 2 - where test runs are sent
 
 The name and picture each post appears under are the ones set on the Discord
 webhook itself; this script does not override them.
@@ -20,8 +21,8 @@ Test options (the two boxes on the workflow's "Run workflow" button):
                           already sent
     TEST_URL=<page link>  post just that one page's section (an SBC,
                           Objectives or Evolutions page) and ignore the 24-hour
-                          window. Posts to server 1 only. Nothing is saved to
-                          state.json, so it never affects the real daily post.
+                          window. Goes to the server(s) chosen by TEST_TARGET.
+                          Nothing is saved to state.json, so it never affects the real daily post.
 
 State (state.json) tracks whether today's digest has already been sent so a
 manual re-run or an accidental double-trigger won't spam duplicate posts.
@@ -52,6 +53,27 @@ DESTINATIONS = [
     for url, role in _RAW_DESTINATIONS
     if url and url.strip()
 ]
+
+
+def _pick_test_destinations():
+    """Where a test run goes, from the 'Where test runs are sent' dropdown
+    (TEST_TARGET: both / server 1 / server 2). Live runs never use this."""
+    target = os.environ.get("TEST_TARGET", "both").strip().lower()
+    slots = {"server 1": [0], "server 2": [1]}.get(target, [0, 1])
+    chosen = []
+    for i in slots:
+        url, role = _RAW_DESTINATIONS[i]
+        if url and url.strip():
+            chosen.append((url.strip(), (role or "").strip() or None))
+        else:
+            print(f"Server {i + 1} has no webhook set - skipping it for this test.")
+    is_test = os.environ.get("TEST_MODE") == "1" or bool(os.environ.get("TEST_URL", "").strip())
+    if is_test and not chosen and os.environ.get("DRY_RUN") != "1":
+        sys.exit(f"No webhook is set for the test target '{target}'.")
+    return chosen
+
+
+TEST_DESTINATIONS = _pick_test_destinations()
 
 TEST_MODE = os.environ.get("TEST_MODE") == "1"
 TEST_URL = os.environ.get("TEST_URL", "").strip()
@@ -550,8 +572,8 @@ def main():
             print("DRY RUN - nothing posted. Messages would be:")
             print(json.dumps(payloads, indent=2, ensure_ascii=False))
             return
-        # Test posts go to the first server only.
-        errors = send_everywhere(payloads, DESTINATIONS[:1])
+        # Test posts go where the 'Where test runs are sent' dropdown says.
+        errors = send_everywhere(payloads, TEST_DESTINATIONS)
         if errors:
             raise RuntimeError("; ".join(errors))
         print("Test post sent. state.json was not changed.")
@@ -580,11 +602,13 @@ def main():
         print(json.dumps(payloads, indent=2, ensure_ascii=False))
         return
 
-    errors = send_everywhere(payloads, DESTINATIONS)
+    targets = TEST_DESTINATIONS if TEST_MODE else DESTINATIONS
+    errors = send_everywhere(payloads, targets)
 
     # Save state if at least one server received the digest, so a re-run
     # doesn't repost to the server that already got it.
-    if len(errors) < len(DESTINATIONS):
+    # Test runs never save, so a test can't make the real daily post skip.
+    if not TEST_MODE and len(errors) < len(targets):
         state["last_digest_date"] = today
         save_state(state)
 
