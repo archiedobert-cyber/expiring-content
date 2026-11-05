@@ -9,6 +9,14 @@ on:
         description: "Test URL"
         type: string
         default: ""
+      test_target:
+        description: "Where test runs are sent"
+        type: choice
+        options:
+          - both
+          - server 1
+          - server 2
+        default: both
 permissions:
   contents: write
 jobs:
@@ -39,12 +47,13 @@ jobs:
           DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
           DISCORD_WEBHOOK_URL_2: ${{ secrets.DISCORD_WEBHOOK_URL_2 }}
           DISCORD_ROLE_ID_2: ${{ secrets.DISCORD_ROLE_ID_2 }}
-          BRAND_AVATAR_URL: ${{ secrets.BRAND_AVATAR_URL }}
           TEST_MODE: ${{ inputs.test && '1' || '' }}
           TEST_URL: ${{ inputs.test_url }}
+          TEST_TARGET: ${{ inputs.test_target }}
         run: python expiring.py
 
       - name: Commit updated state
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
